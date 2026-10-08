@@ -7,149 +7,24 @@ import AppKit
 // Data: `herdr session list` (all sessions, running or stopped) + `maw herdr ls --json` (spaces and
 // worktrees of every running session, ~0.4 s) + the oracle apps installed on this Mac (co.laris.oracle.<key>).
 
-public struct HubSession: Identifiable, Hashable, Sendable {
-    public var id: String { name }
-    public let name: String
-    public let running: Bool
-}
-
-public struct HubSpace: Identifiable, Hashable, Sendable {
-    public var id: String { session + ":" + spaceId }
-    public let session: String
-    public let spaceId: String
-    public let label: String
-    public let number: Int
-    public let status: String       // working · done · blocked · idle · unknown
-    public let repo: String?
-    public let checkout: String?
-    public let linked: Bool
-    public let panes: Int
-    public let agents: Int
-    public var branch: String? = nil    // the checkout's git branch, as herdr's sidebar shows under the name
-}
-
-/// One repo herdr knows about: its live spaces, its worktrees by state, the way back in.
-public struct HubOracle: Identifiable, Hashable, Sendable {
-    public var id: String { repo }
-    public let repo: String
-    public let spaces: [HubSpace]
-    public let running: Int, open: Int, resumable: Int, cold: Int
-    public let checkout: String?
-    public let resume: String?
-    public var name: String { HubParse.displayName(repo) }
-    public var appKey: String { HubParse.appKey(forRepo: repo) }
-    public var isLive: Bool { !spaces.isEmpty }
-    /// The most urgent state across its spaces; with no space open, how it rests.
-    public var status: String {
-        if let s = spaces.map(\.status).min(by: { HubParse.rank($0) < HubParse.rank($1) }) { return s }
-        return resumable > 0 ? "resumable" : "cold"
-    }
-}
-
-public enum HubParse {
-    public static func rank(_ s: String) -> Int { ["blocked": 0, "done": 1, "working": 2, "idle": 3][s] ?? 4 }
-
-    public static func word(_ s: String) -> String {
-        ["blocked": "blocked", "done": "needs you", "working": "working", "idle": "idle",
-         "resumable": "resumable", "cold": "cold"][s] ?? "open"
-    }
-
-    /// The key an oracle's app carries in its bundle id, co.laris.oracle.<key>: the display name lower-cased, with "_"
-    /// and "." made "-" because a bundle id has no "_" ("boon_v2-oracle" → "boon-v2"). scripts/new-oracle-app.sh and
-    /// skills/oracle-app/check.sh apply the same rule; change all three together.
-    public static func appKey(forRepo repo: String) -> String {
-        String(displayName(repo).lowercased().map { $0 == "_" || $0 == "." ? "-" : $0 })
-    }
-
-    /// "neo-oracle" → "Neo", "DustBoy-Phd-Oracle" → "DustBoy-Phd", "pulse" → "Pulse"
-    public static func displayName(_ repo: String) -> String {
-        var s = repo
-        if s.lowercased().hasSuffix("-oracle") { s.removeLast(7) }
-        return s.prefix(1).uppercased() + s.dropFirst()
-    }
-
-    /// `herdr session list --json` → every session and whether its server is running.
-    public static func sessions(_ data: Data) -> [HubSession] {
-        guard let d = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [] }
-        return (d["sessions"] as? [[String: Any]] ?? []).compactMap { s in
-            (s["name"] as? String).map { HubSession(name: $0, running: s["running"] as? Bool ?? false) }
-        }
-    }
-
-    /// maw's oracle registry (`~/.maw/oracles.json`, what `maw locate` reads): one row per oracle repo,
-    /// minus junk rows (a name that starts with "-") and repeats of the same repo.
-    public static func registry(_ data: Data) -> [(repo: String, path: String?)] {
-        guard let d = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [] }
-        var seen = Set<String>(), out: [(repo: String, path: String?)] = []
-        for o in d["oracles"] as? [[String: Any]] ?? [] {
-            guard let name = o["name"] as? String, !name.hasPrefix("-") else { continue }
-            let repo = o["repo"] as? String ?? name
-            if seen.insert(repo.lowercased()).inserted { out.append((repo, o["local_path"] as? String)) }
-        }
-        return out
-    }
-
-    /// `maw herdr ls --json` → every space, and one oracle per repo with its spaces and worktree counts.
-    public static func parse(ls: Data) -> (spaces: [HubSpace], oracles: [HubOracle]) {
-        guard let d = try? JSONSerialization.jsonObject(with: ls) as? [String: Any] else { return ([], []) }
-        var branchOf: [String: String] = [:]   // checkout path -> branch, from the worktree rows
-        for t in d["worktrees"] as? [[String: Any]] ?? [] {
-            if let p = t["path"] as? String, let b = t["branch"] as? String { branchOf[p] = b }
-        }
-        let spaces: [HubSpace] = (d["workspaces"] as? [[String: Any]] ?? []).compactMap { w in
-            guard let s = w["session"] as? String, let id = w["id"] as? String else { return nil }
-            return HubSpace(session: s, spaceId: id, label: w["label"] as? String ?? id, number: w["number"] as? Int ?? 0,
-                            status: w["status"] as? String ?? "unknown", repo: w["repo"] as? String,
-                            checkout: w["checkout"] as? String, linked: w["linked"] as? Bool ?? false,
-                            panes: w["panes"] as? Int ?? 0, agents: w["agents"] as? Int ?? 0,
-                            branch: (w["checkout"] as? String).flatMap { branchOf[$0] })
-        }
-        var byRepo: [String: [[String: Any]]] = [:]
-        for t in d["worktrees"] as? [[String: Any]] ?? [] {
-            if let r = t["repo"] as? String { byRepo[r, default: []].append(t) }
-        }
-        for s in spaces { if let r = s.repo, byRepo[r] == nil { byRepo[r] = [] } }
-        let oracles: [HubOracle] = byRepo.map { repo, wts in
-            func count(_ state: String) -> Int { wts.filter { ($0["state"] as? String) == state }.count }
-            let main = wts.first { ($0["linked"] as? Bool) == false } ?? wts.first
-            var resume: String?
-            if let r = main?["resume"] as? [String: Any], let id = r["id"] as? String, let path = main?["path"] as? String {
-                resume = "cd '\(path)' && " + ((r["provider"] as? String) == "codex" ? "codex resume \(id)" : "claude --resume \(id)")
-            }
-            return HubOracle(repo: repo, spaces: spaces.filter { $0.repo == repo },
-                             running: count("running"), open: count("open"), resumable: count("resumable"), cold: count("cold"),
-                             checkout: main?["repoRoot"] as? String ?? main?["path"] as? String, resume: resume)
-        }
-        return (spaces, oracles.sorted(by: order))
-    }
-
-    /// Urgent first (blocked, needs you, working, idle), then the resting ones; by name inside.
-    static func order(_ a: HubOracle, _ b: HubOracle) -> Bool {
-        let ra = rank(a.status), rb = rank(b.status)
-        if ra != rb { return ra < rb }
-        return a.name.localizedCaseInsensitiveCompare(b.name) == .orderedAscending
-    }
-
-    #if os(macOS)
-    /// Oracle apps on this Mac by the key in their bundle id, co.laris.oracle.<key> (this app excluded).
-    public static func installedApps() -> [String: URL] {
-        var out: [String: URL] = [:]
-        for dir in ["/Applications", NSHomeDirectory() + "/Applications"] {
-            for name in (try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? [] where name.hasSuffix(".app") {
-                let url = URL(fileURLWithPath: dir).appendingPathComponent(name)
-                guard let id = Bundle(url: url)?.bundleIdentifier, id.hasPrefix("co.laris.oracle.") else { continue }
-                let key = String(id.dropFirst("co.laris.oracle.".count))
-                if key != "hub", !key.contains(".") { out[key] = url }
-            }
-        }
-        return out
-    }
-    #endif
-}
-
 @MainActor
 public final class HubStore: ObservableObject {
     @Published public private(set) var sessions: [HubSession] = []
+    /// Remote herdr sessions (HubRemote.swift): remembered by the hub, saved as herdr machines, attached from here now.
+    @Published public private(set) var remotes: [RemoteSession] = []
+    @Published public private(set) var remoteState: [String: RemoteState] = [:]
+    /// each machine (ssh target) the hub knows: its herdr and every session on it (Nat: "if we have many machines,
+    /// group, show machine")
+    @Published public private(set) var remoteMachines: [String: RemoteMachineState] = [:]
+    private var knownRemotes: [RemoteSession] = []   // remembered, saved machines, attached now: what the probe asks
+    /// remotes with a `herdr --remote` client running on this Mac now
+    @Published public private(set) var attachedRemotes: Set<String> = []
+    /// local session folders that are only a remote client's trace → the remote that left it
+    @Published public private(set) var remoteTraces: [String: RemoteSession] = [:]
+    /// …and the traces no known target explains: session name → the target's first 8 characters, as herdr kept them
+    @Published public private(set) var unknownTraces: [String: String] = [:]
+    private var lastRemoteProbe = Date.distantPast
+    private var probing = false
     @Published public private(set) var spaces: [HubSpace] = []
     @Published public private(set) var oracles: [HubOracle] = []
     @Published public private(set) var apps: [String: URL] = [:]
@@ -192,8 +67,151 @@ public final class HubStore: ObservableObject {
             .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         problems = issues
         lastRefresh = Date()
+        await refreshRemotes()
         #endif
     }
+
+    /// The local sessions, without the folders that are only a remote client's trace.
+    public var localSessions: [HubSession] { sessions.filter { remoteTraces[$0.name] == nil && unknownTraces[$0.name] == nil } }
+
+    #if os(macOS)
+    /// Remote sessions: attached from here now (the process table carries `herdr --remote <target> --session <s>`),
+    /// saved as herdr machines, remembered, and read back from the traces a remote attach leaves in
+    /// ~/.config/herdr/sessions (`RemoteParse.socketHash`). Probed over ssh in the background, at most every 45 s.
+    func refreshRemotes() async {
+        async let ps = Shell.run("ps", ["-axo", "args="])
+        async let machineList = Shell.run("herdr", ["machine", "list", "--json"])
+        let (psOut, machineOut) = await (ps, machineList)
+        let live = Set((psOut ?? "").split(separator: "\n").compactMap { RemoteParse.remote(of: String($0)) })
+        let machines = machineOut.map { RemoteParse.machines(Data($0.utf8)) } ?? []
+        var remembered = RemoteRegistry.load()
+        var changed = false
+        for r in live where !remembered.contains(where: { $0.id == r.id }) { remembered.append(r); changed = true }
+        let traces: [(name: String, trace: (prefix: String, hash: String))] = sessions.compactMap { s in
+            guard !s.running, !s.isDefault, let dir = s.dir, Self.isRemoteTrace(dir: dir),
+                  let log = Self.tail(dir + "/herdr-client.log"), let t = RemoteParse.trace(clientLog: log) else { return nil }
+            return (s.name, t)
+        }
+        var matched: [String: RemoteSession] = [:]
+        let sshConfig = traces.isEmpty ? "" : ((try? String(contentsOfFile: NSHomeDirectory() + "/.ssh/config", encoding: .utf8)) ?? "")
+        for _ in 0..<3 {   // a trace found teaches its domain, which can explain the next one
+            var learned = false
+            for (name, t) in traces where matched[name] == nil {
+                let known = remembered + machines
+                if let r = known.first(where: { $0.session == name && RemoteParse.left(t, $0) }) { matched[name] = r; continue }
+                let found = RemoteParse.candidates(sshConfig: sshConfig, knownTargets: known.map(\.target))
+                    .lazy.map { RemoteSession(target: $0, session: name) }.first { RemoteParse.left(t, $0) }
+                if let r = found { matched[name] = r; remembered.append(r); changed = true; learned = true }
+            }
+            if !learned { break }
+        }
+        if changed { RemoteRegistry.save(remembered) }
+        var all = machines
+        for r in remembered where !all.contains(where: { $0.id == r.id }) { all.append(r) }
+        knownRemotes = all
+        remotes = withDiscovered(all)
+        attachedRemotes = Set(live.map(\.id))
+        remoteTraces = matched
+        unknownTraces = Dictionary(uniqueKeysWithValues: traces.filter { matched[$0.name] == nil }.map { ($0.name, $0.trace.prefix) })
+        if Date().timeIntervalSince(lastRemoteProbe) > 45 { lastRemoteProbe = Date(); Task { await probeRemotes() } }
+    }
+
+    /// The known remotes plus every session running on their machines that the hub did not know of yet.
+    private func withDiscovered(_ known: [RemoteSession]) -> [RemoteSession] {
+        var all = known
+        for (target, m) in remoteMachines {
+            for (name, running) in m.sessions where running {
+                let r = RemoteSession(target: target, session: name)
+                if r.isSafe, !all.contains(where: { $0.id == r.id }) { all.append(r) }
+            }
+        }
+        return all
+    }
+
+    /// Each machine once, all at once: `herdr session list` over ssh, then the agents of its running sessions.
+    public func probeRemotes() async {
+        guard !probing else { return }
+        probing = true; defer { probing = false }
+        let targets = Array(Set(knownRemotes.filter(\.isSafe).map(\.target)))
+        let ssh = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=6"]
+        await withTaskGroup(of: (String, RemoteMachineState, [String: RemoteState]).self) { g in
+            for target in targets {
+                g.addTask {
+                    guard let out = await Shell.run("ssh", ssh + [target, RemoteParse.listCommand()], timeout: 20) else {
+                        return (target, RemoteMachineState(problem: "ssh \(target) did not answer without a prompt — try it in a terminal:\n  ssh \(target)"), [:])
+                    }
+                    guard let m = RemoteParse.machine(out) else {
+                        return (target, RemoteMachineState(problem: "no herdr on \(target)'s PATH (~/.local/bin, /opt/homebrew/bin, /usr/local/bin)"), [:])
+                    }
+                    let running = m.sessions.filter { $0.running && RemoteSession(target: target, session: $0.name).isSafe }.map(\.name)
+                    var states: [String: RemoteState] = [:]
+                    if !running.isEmpty, let a = await Shell.run("ssh", ssh + [target, RemoteParse.agentsCommand(sessions: running)], timeout: 25) {
+                        states = RemoteParse.agents(a, version: m.version)
+                    }
+                    for s in m.sessions where !s.running { states[s.name] = RemoteState(running: false, version: m.version) }
+                    return (target, RemoteMachineState(version: m.version, sessions: Dictionary(m.sessions.map { ($0.name, $0.running) }, uniquingKeysWith: { a, _ in a })), states)
+                }
+            }
+            for await (target, machine, states) in g {
+                remoteMachines[target] = machine
+                for (name, st) in states { remoteState[RemoteSession(target: target, session: name).id] = st }
+                if let p = machine.problem {
+                    for r in knownRemotes where r.target == target { remoteState[r.id] = RemoteState(running: false, problem: p) }
+                }
+            }
+        }
+        remotes = withDiscovered(knownRemotes)
+    }
+
+    /// A folder herdr lists as a session but that only a remote client wrote: a client log, no session.json or server log.
+    nonisolated static func isRemoteTrace(dir: String) -> Bool {
+        let fm = FileManager.default
+        return fm.fileExists(atPath: dir + "/herdr-client.log") && !fm.fileExists(atPath: dir + "/session.json")
+            && !fm.fileExists(atPath: dir + "/herdr-server.log")
+    }
+
+    nonisolated static func tail(_ path: String, bytes: Int = 65_536) -> String? {
+        guard let h = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? h.close() }
+        let size = (try? h.seekToEnd()) ?? 0
+        try? h.seek(toOffset: size > UInt64(bytes) ? size - UInt64(bytes) : 0)
+        return (try? h.readToEnd()).map { String(decoding: $0, as: UTF8.self) }
+    }
+
+    /// Its WezTerm window when this Mac is attached; otherwise a new one running `herdr --remote <target> --session <s>`.
+    public func openRemote(_ r: RemoteSession) {
+        guard r.isSafe else { return }
+        Task.detached { await WezTerm.show(remote: r) }
+    }
+
+    /// Remember a remote by hand (Add remote…); nil when added, else why not.
+    public func addRemote(target: String, session: String) async -> String? {
+        let r = RemoteSession(target: target.trimmingCharacters(in: .whitespaces), session: session.trimmingCharacters(in: .whitespaces))
+        guard r.isSafe else { return "a target is user@host (letters, digits, . _ - @ :), a session a plain name" }
+        var list = RemoteRegistry.load()
+        if !list.contains(where: { $0.id == r.id }) { list.append(r); RemoteRegistry.save(list) }
+        lastRemoteProbe = .distantPast
+        await refreshRemotes()
+        return nil
+    }
+
+    /// Forget one the hub remembered (a saved herdr machine stays: `herdr machine remove <id>`).
+    public func forgetRemote(_ r: RemoteSession) {
+        RemoteRegistry.save(RemoteRegistry.load().filter { $0.id != r.id })
+        knownRemotes.removeAll { $0.id == r.id && $0.label == nil }
+        remotes = withDiscovered(knownRemotes)
+    }
+
+    /// Forget a whole machine the hub remembered (its saved herdr machines stay: `herdr machine remove <id>`).
+    public func forgetMachine(host: String) {
+        RemoteRegistry.save(RemoteRegistry.load().filter { $0.host != host })
+        knownRemotes.removeAll { $0.host == host && $0.label == nil }
+        for t in remoteMachines.keys where RemoteSession(target: t, session: "x").host == host && !knownRemotes.contains(where: { $0.target == t }) {
+            remoteMachines[t] = nil
+        }
+        remotes = withDiscovered(knownRemotes)
+    }
+    #endif
 
     /// Oracles that have an app, in name order — shown first, live or not.
     public var appOracles: [HubOracle] {
@@ -204,9 +222,24 @@ public final class HubStore: ObservableObject {
     }
 
     #if os(macOS)
+    /// A click on an app card brings the app to the main display (Nat, 2026-10-08): it is sent
+    /// `oracle-<name>://front?display=<main display>` and moves its own window there, so no Accessibility or yabai.
+    /// The app is named by its bundle, so a dev build that registered the same scheme never gets the link.
     public func openApp(_ key: String) {
         guard let url = apps[key] else { return }
-        NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
+        if let link = Self.frontLink(app: url, display: CGMainDisplayID()) {
+            NSWorkspace.shared.open([link], withApplicationAt: url, configuration: NSWorkspace.OpenConfiguration())
+        } else {
+            NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
+        }
+    }
+
+    /// `oracle-<name>://front?display=<id>` from the app's own URL scheme (its Info.plist); nil for an app without one.
+    nonisolated public static func frontLink(app: URL, display: CGDirectDisplayID) -> URL? {
+        guard let types = Bundle(url: app)?.infoDictionary?["CFBundleURLTypes"] as? [[String: Any]],
+              let scheme = types.flatMap({ $0["CFBundleURLSchemes"] as? [String] ?? [] }).first(where: { $0.hasPrefix("oracle-") })
+        else { return nil }
+        return URL(string: "\(scheme)://front?display=\(display)")
     }
 
     /// Focus the space in herdr, by the state of the session's WezTerm window:
@@ -286,6 +319,89 @@ public final class HubStore: ObservableObject {
 
     /// Stop a whole session: its server and every pane in it end. herdr resumes each recorded agent on reopen
     /// (see `resumeCheck`). nil when it stopped; otherwise the error with the command to run.
+    /// What a stopped session holds, for the confirmation: the spaces session.json saved, and its files.
+    public struct SessionContents: Sendable, Equatable {
+        public let spaces: [String]
+        public let files: Int
+        public let bytes: Int64
+    }
+
+    nonisolated public static func contents(of s: HubSession) -> SessionContents {
+        guard let dir = s.dir else { return SessionContents(spaces: [], files: 0, bytes: 0) }
+        var spaces: [String] = []
+        if let d = FileManager.default.contents(atPath: dir + "/session.json"),
+           let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any], let ws = o["workspaces"] as? [[String: Any]] {
+            // a space is named by herdr's custom name, else its folder (identity_cwd), else its id
+            spaces = ws.map { w in (w["custom_name"] as? String) ?? (w["identity_cwd"] as? String).map { ($0 as NSString).lastPathComponent }
+                                   ?? (w["id"] as? String) ?? "space" }
+        }
+        let files = keepable(in: URL(fileURLWithPath: dir))
+        return SessionContents(spaces: spaces, files: files.count, bytes: files.reduce(0) { $0 + $1.size })
+    }
+
+    /// The regular files under a session's folder: sockets and other specials are skipped (a stopped session keeps
+    /// stale `herdr.sock` files, and a socket cannot be copied).
+    nonisolated static func keepable(in dir: URL) -> [(url: URL, size: Int64)] {
+        let keys: [URLResourceKey] = [.isRegularFileKey, .fileSizeKey]
+        guard let e = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: keys) else { return [] }
+        return e.compactMap { item -> (URL, Int64)? in
+            guard let u = item as? URL, let v = try? u.resourceValues(forKeys: Set(keys)), v.isRegularFile == true else { return nil }
+            return (u, Int64(v.fileSize ?? 0))
+        }
+    }
+
+    /// Where a deleted session's files are kept: ~/Library/Application Support/ARRA Oracles/deleted-sessions.
+    nonisolated public static var deletedSessions: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("ARRA Oracles/deleted-sessions", isDirectory: true)
+    }
+
+    /// Copy a session's regular files to `deleted-sessions/<name>-<yyyyMMdd-HHmmss>` (Nothing is Deleted): the copy,
+    /// or why it failed.
+    enum Kept: Equatable { case copy(URL), failed(String) }
+
+    nonisolated static func keepCopy(of s: HubSession, at now: Date = Date(), into root: URL = deletedSessions) -> Kept {
+        guard let dir = s.dir else { return .failed("herdr did not say where \(s.name) keeps its files") }
+        let f = DateFormatter(); f.dateFormat = "yyyyMMdd-HHmmss"; f.locale = Locale(identifier: "en_US_POSIX")
+        let to = root.appendingPathComponent("\(s.name)-\(f.string(from: now))", isDirectory: true)
+        let from = URL(fileURLWithPath: dir).standardizedFileURL
+        do {
+            for (u, _) in keepable(in: from) {
+                let rel = String(u.standardizedFileURL.path.dropFirst(from.path.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                let dest = to.appendingPathComponent(rel)
+                try FileManager.default.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try FileManager.default.copyItem(at: u, to: dest)
+            }
+            try FileManager.default.createDirectory(at: to, withIntermediateDirectories: true)   // an empty session still leaves its mark
+            return .copy(to)
+        } catch {
+            let ns = error as NSError
+            return .failed("could not keep a copy of \(s.name) in \(to.path) (\(ns.domain) \(ns.code)); nothing was deleted")
+        }
+    }
+
+    /// Why a session is not deleted from here: the default one is herdr's own config folder; a running one is stopped first.
+    nonisolated static func refusal(_ s: HubSession) -> String? {
+        if s.isDefault { return "the default session is herdr's own config folder (~/.config/herdr); it is not deleted from here" }
+        if s.running { return "\(s.name) is running: stop it first, then delete it\n  herdr session stop \(s.name)" }
+        return nil
+    }
+
+    /// Delete a stopped session with `herdr session delete`, after keeping a copy of its files. nil when it is gone;
+    /// otherwise what went wrong, with the command to run.
+    public func deleteSession(_ s: HubSession) async -> String? {
+        if let no = Self.refusal(s) { return no }
+        switch Self.keepCopy(of: s) {
+        case .failed(let why): return why
+        case .copy(let kept): HubLog.shared.add(.info, "session \(s.name): a copy of its files is in \(kept.path)")
+        }
+        let out = await Shell.run("herdr", ["session", "delete", s.name], timeout: 20)
+        await refresh()
+        if out == nil { return "herdr could not delete \(s.name) — run it in a terminal to see why:\n  herdr session delete \(s.name)" }
+        HubLog.shared.add(.info, "session \(s.name) deleted (herdr session delete)")
+        return nil
+    }
+
     public func stopSession(_ name: String) async -> String? {
         let out = await Shell.run("herdr", ["session", "stop", name], timeout: 20)
         await refresh()
@@ -293,171 +409,3 @@ public final class HubStore: ObservableObject {
     }
     #endif
 }
-
-#if os(macOS)
-/// WezTerm hosts the herdr clients. Its CLI finds the pane that runs `herdr [--session S]` and brings it forward.
-public enum WezTerm {
-    public static let bundleId = "com.github.wez.wezterm"
-
-    /// Bring the session to Nat: find the WezTerm window that shows it (herdr titles its client
-    /// "<host>: <space>"), move it to the main display's visible space, centre it and focus it — Window
-    /// Arranger's ⌘⏎ "ย้ายมา". No client yet: open one in a new WezTerm window and bring that. No yabai: the
-    /// WezTerm CLI alone (activate the client pane, or spawn one) and raise WezTerm.
-    public static func show(session: String, label: String? = nil) async {
-        let yabai = Shell.which("yabai") != nil
-        var window: Int?
-        if yabai, let label {
-            try? await Task.sleep(nanoseconds: 350_000_000)          // herdr retitles the client after the focus
-            window = await yabaiWindow(titled: { $0 == label || $0.hasSuffix(": " + label) })
-        }
-        let clients = await panes(running: session)
-        if window == nil, yabai, let c = clients.first {
-            window = await yabaiWindow(titled: { $0 == c.windowTitle })
-        }
-        if window == nil {
-            if let c = clients.first {
-                _ = await Shell.run("wezterm", ["cli", "activate-pane", "--pane-id", String(c.pane)])
-            } else {
-                let before = Set(await weztermWindows())
-                var args = ["cli", "spawn", "--new-window", "--", Shell.which("herdr") ?? "herdr"]
-                if session != "default" { args += ["--session", session] }
-                _ = await Shell.run("wezterm", args)
-                for _ in 0..<12 where yabai && window == nil {          // the new window shows up within ~1 s
-                    try? await Task.sleep(nanoseconds: 200_000_000)
-                    window = await weztermWindows().first { !before.contains($0) }
-                }
-            }
-        }
-        if let window { await bringToMain(window) }
-        else { await MainActor.run { _ = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId).first?.activate() } }
-    }
-
-    /// Where the WezTerm window holding a session's herdr client is, as Nat sees it (Nat, 2026-10-08: "2 modes —
-    /// active on some window, not active (behind) some window").
-    public enum ClientWindow: Equatable, Sendable {
-        case front(window: Int, screen: String)    // visible: on a shown space, not minimised, at most half covered
-        case behind(window: Int, screen: String)   // covered by other windows, on a hidden space, or minimised
-        case none                                  // no WezTerm window runs this session's client
-        public var label: String {
-            switch self {
-            case .front(_, let s): return "front · \(s)"
-            case .behind(_, let s): return "behind · \(s)"
-            case .none: return "no window"
-            }
-        }
-    }
-
-    /// The state of `session`'s client window. "Covered" samples a 12×12 grid of the window's rectangle against
-    /// the on-screen windows above it (the window list is front to back), so overlaps are not counted twice.
-    public static func clientWindow(session: String) async -> ClientWindow {
-        guard Shell.which("yabai") != nil else { return .none }
-        var id: Int?
-        for c in await panes(running: session) { if let w = await yabaiWindow(titled: { $0 == c.windowTitle }) { id = w; break } }
-        guard let id, let win = await yabaiJSON(["--windows", "--window", String(id)]) as? [String: Any] else { return .none }
-        let screen = await screenName(display: win["display"] as? Int)
-        if (win["is-visible"] as? Bool) != true || (win["is-minimized"] as? Bool) == true { return .behind(window: id, screen: screen) }
-        return covered(window: id) > 0.5 ? .behind(window: id, screen: screen) : .front(window: id, screen: screen)
-    }
-
-    /// The share of a window hidden by the normal windows above it (0…1).
-    static func covered(window id: Int) -> Double {
-        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else { return 0 }
-        func rect(_ w: [String: Any]) -> CGRect? {
-            guard let b = w[kCGWindowBounds as String] as? [String: CGFloat] else { return nil }
-            return CGRect(x: b["X"] ?? 0, y: b["Y"] ?? 0, width: b["Width"] ?? 0, height: b["Height"] ?? 0)
-        }
-        let normal = list.filter { ($0[kCGWindowLayer as String] as? Int) == 0 }
-        guard let i = normal.firstIndex(where: { ($0[kCGWindowNumber as String] as? Int) == id }), let r = rect(normal[i]), r.width > 0, r.height > 0 else { return 0 }
-        let above = normal[..<i].compactMap(rect)
-        var hit = 0, n = 12
-        for a in 0..<n { for b in 0..<n {
-            let p = CGPoint(x: r.minX + (CGFloat(a) + 0.5) * r.width / CGFloat(n), y: r.minY + (CGFloat(b) + 0.5) * r.height / CGFloat(n))
-            if above.contains(where: { $0.contains(p) }) { hit += 1 }
-        } }
-        return Double(hit) / Double(n * n)
-    }
-
-    /// A display's name ("DELL S2725QS") from yabai's display index; "screen #n" when macOS does not say.
-    static func screenName(display index: Int?) async -> String {
-        guard let index, let displays = await yabaiJSON(["--displays"]) as? [[String: Any]],
-              let d = displays.first(where: { ($0["index"] as? Int) == index }), let cg = d["id"] as? Int else { return "screen #\(index ?? 0)" }
-        return await MainActor.run {
-            NSScreen.screens.first { ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.intValue == cg }?.localizedName
-        } ?? "screen #\(index)"
-    }
-
-    /// The yabai display index of the screen the hub's own window is on (nil: no window).
-    @MainActor static func hubDisplayID() -> Int? {
-        (NSApp.mainWindow?.screen ?? NSApp.windows.first(where: \.isVisible)?.screen)?
-            .deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")].flatMap { ($0 as? NSNumber)?.intValue }
-    }
-
-    /// The CGDirectDisplayID of the screen a yabai window is on.
-    static func displayID(window id: Int) async -> Int? {
-        guard let win = await yabaiJSON(["--windows", "--window", String(id)]) as? [String: Any], let index = win["display"] as? Int,
-              let displays = await yabaiJSON(["--displays"]) as? [[String: Any]] else { return nil }
-        return displays.first { ($0["index"] as? Int) == index }?["id"] as? Int
-    }
-
-    /// Move a window to the main display (the one at the origin), centred on its visible space, and focus it.
-    static func bringToMain(_ id: Int) async {
-        guard let displays = await yabaiJSON(["--displays"]) as? [[String: Any]],
-              let main = displays.first(where: { d in
-                  let f = d["frame"] as? [String: Double]; return f?["x"] == 0 && f?["y"] == 0
-              }) ?? displays.first(where: { ($0["index"] as? Int) == 1 }),
-              let index = main["index"] as? Int, let frame = main["frame"] as? [String: Double],
-              let spaces = await yabaiJSON(["--spaces", "--display", String(index)]) as? [[String: Any]],
-              let here = spaces.first(where: { ($0["is-visible"] as? Bool) == true })?["index"] as? Int,
-              let win = await yabaiJSON(["--windows", "--window", String(id)]) as? [String: Any] else {
-            _ = await Shell.run("yabai", ["-m", "window", String(id), "--focus"]); return
-        }
-        if (win["space"] as? Int) != here {
-            _ = await Shell.run("yabai", ["-m", "window", String(id), "--space", String(here)])
-            let wf = win["frame"] as? [String: Double] ?? [:]
-            if let w = wf["w"], let h = wf["h"], let x = frame["x"], let y = frame["y"], let W = frame["w"], let H = frame["h"] {
-                _ = await Shell.run("yabai", ["-m", "window", String(id), "--move", "abs:\(Int(x + (W - w) / 2)):\(Int(y + (H - h) / 2))"])
-            }
-        }
-        _ = await Shell.run("yabai", ["-m", "window", String(id), "--focus"])
-    }
-
-    static func yabaiJSON(_ query: [String]) async -> Any? {
-        guard let out = await Shell.run("yabai", ["-m", "query"] + query) else { return nil }
-        return try? JSONSerialization.jsonObject(with: Data(out.utf8))
-    }
-
-    static func weztermWindows() async -> [Int] {
-        (await yabaiJSON(["--windows"]) as? [[String: Any]] ?? [])
-            .filter { ($0["app"] as? String) == "WezTerm" }.compactMap { $0["id"] as? Int }
-    }
-
-    static func yabaiWindow(titled match: (String) -> Bool) async -> Int? {
-        (await yabaiJSON(["--windows"]) as? [[String: Any]] ?? []).first { w in
-            (w["app"] as? String) == "WezTerm" && (w["title"] as? String).map(match) == true
-        }?["id"] as? Int
-    }
-
-    /// WezTerm panes whose terminal runs a local herdr client attached to `session`, with their window's title.
-    public static func panes(running session: String) async -> [(pane: Int, windowTitle: String)] {
-        guard let json = await Shell.run("wezterm", ["cli", "list", "--format", "json"]),
-              let list = try? JSONSerialization.jsonObject(with: Data(json.utf8)) as? [[String: Any]] else { return [] }
-        var out: [(pane: Int, windowTitle: String)] = []
-        for p in list {
-            guard let id = p["pane_id"] as? Int, let tty = (p["tty_name"] as? String)?.replacingOccurrences(of: "/dev/", with: "") else { continue }
-            let ps = await Shell.run("ps", ["-o", "args=", "-t", tty]) ?? ""
-            if ps.split(separator: "\n").contains(where: { herdrSession(of: String($0)) == session }) {
-                out.append((id, p["window_title"] as? String ?? ""))
-            }
-        }
-        return out
-    }
-
-    /// "herdr --session ccdc" → "ccdc", a bare "herdr" → "default"; remote clients and one-shot CLI calls → nil.
-    public static func herdrSession(of args: String) -> String? {
-        let f = args.split(separator: " ").map(String.init)
-        guard let first = f.first, (first as NSString).lastPathComponent == "herdr", !f.contains("--remote") else { return nil }
-        if let i = f.firstIndex(of: "--session"), i + 1 < f.count { return f.count == i + 2 ? f[i + 1] : nil }
-        return f.count == 1 ? "default" : nil
-    }
-}
-#endif
